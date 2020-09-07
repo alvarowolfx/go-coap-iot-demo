@@ -1,0 +1,21 @@
+storage:
+  #type: "mongodb"
+  #url: "mongodb://localhost:27017"
+  type: "local"
+  url: "./local.db"
+
+messaging:
+  type: "mem"
+
+api:
+  port: 8080
+
+gateways:
+  - protocol: coap
+    port: 5688
+    sslPort: 5689
+  - protocol: http
+    port: 9000
+
+metrics:
+  type: prometheus

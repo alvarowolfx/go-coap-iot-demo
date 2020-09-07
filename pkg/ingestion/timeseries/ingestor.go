@@ -3,37 +3,38 @@ package timeseries
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"strconv"
 	"time"
 
-	"gocloud.dev/docstore"
+	"com.aviebrantz.coap-demo/pkg/core/store/historical"
+	"github.com/apex/log"
 	"gocloud.dev/pubsub"
 )
 
 type TimeseriesDataIngestor struct {
-	dataSub           *pubsub.Subscription
-	deviceHistoryColl *docstore.Collection
+	dataSub *pubsub.Subscription
+	tsStore historical.TimeSeriesStore
+	logger  *log.Entry
 }
 
-func NewIngestor(dataSub *pubsub.Subscription, deviceHistoryColl *docstore.Collection) *TimeseriesDataIngestor {
+func NewIngestor(dataSub *pubsub.Subscription, tsStore historical.TimeSeriesStore) *TimeseriesDataIngestor {
+	logger := log.WithField("module", "timeseries-ingestor")
 	return &TimeseriesDataIngestor{
-		dataSub:           dataSub,
-		deviceHistoryColl: deviceHistoryColl,
+		dataSub: dataSub,
+		tsStore: tsStore,
+		logger:  logger,
 	}
 }
 
 func (tsi TimeseriesDataIngestor) Start() {
-	// Loop on received messages.
 	for {
 		ctx := context.Background()
 		msg, err := tsi.dataSub.Receive(ctx)
 		if err != nil {
-			// Errors from Receive indicate that Receive will no longer succeed.
-			log.Printf("Receiving message: %v", err)
+			tsi.logger.Infof("Receiving message: %v", err)
 			break
 		}
-		// Do work based on the message, for example:
+
 		deviceID := msg.Metadata["deviceID"]
 		var reportedTime time.Time
 		timeInt, err := strconv.ParseInt(msg.Metadata["time"], 10, 64)
@@ -43,23 +44,23 @@ func (tsi TimeseriesDataIngestor) Start() {
 			reportedTime = time.Unix(timeInt, 0)
 		}
 
-		log.Printf("Got message: %s - %v - %q\n", deviceID, reportedTime, msg.Body)
+		tsi.logger.Infof("Got message: %s - %v - %q\n", deviceID, reportedTime, msg.Body)
 
 		var datapoint map[string]interface{}
 		err = json.Unmarshal(msg.Body, &datapoint)
 		if err != nil {
-			log.Printf("Invalid msg format :%v", err)
+			tsi.logger.Warnf("Invalid msg format :%v", err)
 			// Drop msg
 			msg.Ack()
 			return
 		}
 
-		datapoint["deviceID"] = deviceID
-		datapoint["time"] = reportedTime
+		err = tsi.tsStore.InsertDataPoint(ctx, "device", deviceID, reportedTime, datapoint)
 
-		err = tsi.deviceHistoryColl.Actions().Create(datapoint).Do(ctx)
 		if err != nil {
-			log.Printf("err insert device history :%v", err)
+			tsi.logger.Errorf("err insert device history :%v", err)
+			msg.Nack()
+			return
 		}
 
 		// Messages must always be acknowledged with Ack.

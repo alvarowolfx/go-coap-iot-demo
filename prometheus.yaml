@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+
+  external_labels:
+    monitor: "iot_demo"
+
+scrape_configs:
+  - job_name: "iot_demo"
+
+    scrape_interval: 5s
+
+    static_configs:
+      - targets: ["localhost:8888"]

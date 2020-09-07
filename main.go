@@ -2,74 +2,159 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"com.aviebrantz.coap-demo/api"
-	"com.aviebrantz.coap-demo/gateway/coap"
-	"com.aviebrantz.coap-demo/ingestion/realtime"
-	"com.aviebrantz.coap-demo/ingestion/timeseries"
-	"gocloud.dev/docstore"
+	"github.com/apex/log"
+
+	"com.aviebrantz.coap-demo/pkg/api"
+	"com.aviebrantz.coap-demo/pkg/config"
+	"com.aviebrantz.coap-demo/pkg/core/store/devices"
+	"com.aviebrantz.coap-demo/pkg/core/store/historical"
+	"com.aviebrantz.coap-demo/pkg/core/store/projects"
+	"com.aviebrantz.coap-demo/pkg/gateway/coap"
+	"com.aviebrantz.coap-demo/pkg/ingestion/realtime"
+	"com.aviebrantz.coap-demo/pkg/ingestion/timeseries"
 	"gocloud.dev/pubsub"
+
+	bolt "go.etcd.io/bbolt"
 
 	_ "gocloud.dev/docstore/memdocstore"
 	_ "gocloud.dev/docstore/mongodocstore"
 	_ "gocloud.dev/pubsub/mempubsub"
 )
 
+var (
+	dataTopic *pubsub.Topic
+)
+
+func setupDataTopic(ctx context.Context) error {
+	if dataTopic != nil {
+		return nil
+	}
+
+	var err error
+	dataTopic, err = pubsub.OpenTopic(ctx, "mem://dataTopic")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setupDataSub(ctx context.Context) (*pubsub.Subscription, error) {
+	dataSub, err := pubsub.OpenSubscription(ctx, "mem://dataTopic")
+	if err != nil {
+		return nil, err
+	}
+	return dataSub, nil
+}
+
+func shutdownTopic(ctx context.Context, topic *pubsub.Topic) {
+	if topic == nil {
+		return
+	}
+	topic.Shutdown(ctx)
+}
+
+func shutdownSub(ctx context.Context, sub *pubsub.Subscription) {
+	if sub == nil {
+		return
+	}
+	sub.Shutdown(ctx)
+}
+
+func getDocStoreUrl(coll, id string) string {
+	baseDocStoreURL := "mongo://iot-coap-platform/"
+	url := baseDocStoreURL + coll
+	if id != "" {
+		url += "?id_field=" + id
+	}
+	return url
+	//baseDocStoreURL := "mem://devices/deviceID"
+	//return baseDocStoreURL + coll + "/" + id
+}
+
 func main() {
+	config, err := config.LoadConfig()
+	if err != nil {
+		log.Fatalf("err loading config file: %v", err)
+	}
+
 	ctx := context.Background()
-	dataTopic, err := pubsub.OpenTopic(ctx, "mem://dataTopic")
+	err = setupDataTopic(ctx)
 	if err != nil {
 		log.Fatalf("Err creating data topic :%v", err)
 	}
-	defer dataTopic.Shutdown(ctx)
+	defer shutdownTopic(ctx, dataTopic)
 
-	dataSub, err := pubsub.OpenSubscription(ctx, "mem://dataTopic")
+	realtimeIngestorSub, err := setupDataSub(ctx)
 	if err != nil {
 		log.Fatalf("could not open data topic subscription :%v", err)
 	}
-	defer dataSub.Shutdown(ctx)
+	defer shutdownSub(ctx, realtimeIngestorSub)
 
-	deviceCollURL := "mongo://iot-coap-platform/devices?id_field=deviceID"
+	tsIngestorSub, err := setupDataSub(ctx)
+	if err != nil {
+		log.Fatalf("could not open data topic subscription :%v", err)
+	}
+	defer shutdownSub(ctx, tsIngestorSub)
+
 	os.Setenv("MONGO_SERVER_URL", "mongodb://localhost:27017")
-	//deviceCollURL := "mem://devices/deviceID"
+	/*deviceCollURL := getDocStoreUrl("devices", "deviceID")
 	devicesColl, err := docstore.OpenCollection(ctx, deviceCollURL)
 	if err != nil {
 		log.Fatalf("could not open devices collection :%v", err)
 	}
 	defer devicesColl.Close()
 
-	deviceHistoryCollURL := "mongo://iot-coap-platform/device_history"
-	//deviceHistoryCollURL := "mem://device_history/id"
+	projectsCollURL := getDocStoreUrl("projects", "id")
+	projectsColl, err := docstore.OpenCollection(ctx, projectsCollURL)
+	if err != nil {
+		log.Fatalf("could not open project collection :%v", err)
+	}
+	defer projectsColl.Close()
+
+	deviceHistoryCollURL := getDocStoreUrl("device_history", "")
 	deviceHistoryColl, err := docstore.OpenCollection(ctx, deviceHistoryCollURL)
 	if err != nil {
 		log.Fatalf("could not open device history collection :%v", err)
 	}
 	defer deviceHistoryColl.Close()
+	*/
 
-	coapGateway := coap.NewGateway(dataTopic)
-	realtimeIngestor := realtime.NewIngestor(dataSub, devicesColl)
-	timeseriesIngestor := timeseries.NewIngestor(dataSub, deviceHistoryColl)
-	apiServer := api.NewServer(devicesColl)
+	//deviceStore := devices.NewDeviceDocStore(devicesColl)
+	//projectStore := projects.NewProjectDocStore(projectsColl)
 
-	go coapGateway.Start()
+	db, err := bolt.Open(config.StorageConfig.URL, 0600, nil)
+	if err != nil {
+		log.Fatalf("could not open device local store: %v", err)
+	}
+
+	deviceStore := devices.NewDeviceLocalStore(db)
+	projectStore := projects.NewProjectLocalStore(db)
+	timeseriesStore := historical.NewTimeSeriesLocalStore(db)
+
+	for _, cfg := range config.GatewayConfigs {
+		if cfg.Protocol == "coap" {
+			gateway := coap.NewGateway(dataTopic, &cfg)
+			go gateway.Start()
+		}
+	}
+
+	realtimeIngestor := realtime.NewIngestor(realtimeIngestorSub, deviceStore)
+	timeseriesIngestor := timeseries.NewIngestor(tsIngestorSub, timeseriesStore)
+	apiServer := api.NewServer(deviceStore, projectStore, timeseriesStore, config.APIServerConfig)
+
 	go realtimeIngestor.Start()
 	go timeseriesIngestor.Start()
 	go apiServer.Start()
+	//go metrics.StartMetricsExporter()
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	log.Print("Server Started")
+	log.Info("Server Started")
 	<-done
-	log.Print("Server Stopped")
-
-	// for tcp
-	// log.Fatal(coap.ListenAndServe("tcp", ":5688",  r))
-	// for tcp-tls
-	// log.Fatal(coap.ListenAndServeTLS("tcp", ":5688", &tls.Config{...}, r))
-	// for udp-dtls
-	// log.Fatal(coap.ListenAndServeDTLS("udp", ":5688", &dtls.Config{...}, r))
+	log.Info("Server Stopped")
 }
